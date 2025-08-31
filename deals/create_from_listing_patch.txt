@@ -1,0 +1,22 @@
+
+PATCH для deals/create.php:
+
+1) В начале файла, если есть $_GET['from_listing'], подтянуть данные объявления:
+   $lid = (int)($_GET['from_listing'] ?? 0);
+   if ($lid) {
+      $st = $pdo->prepare('SELECT * FROM listings WHERE id=? AND status="ACTIVE"');
+      $st->execute([$lid]);
+      $listing = $st->fetch();
+      if ($listing) {
+         // prefill
+         $prefillSeller = $listing['seller_id'];
+         $prefillUrl = $listing['url'];
+         $prefillCashback = $listing['cashback'];
+         $prefillTitle = $listing['title'];
+      }
+   }
+
+2) В HTML-форме подставить значения (readonly для url/cashback/продавца).
+
+3) При INSERT в deals добавить listing_id.
+

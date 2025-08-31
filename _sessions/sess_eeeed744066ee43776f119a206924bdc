@@ -1,0 +1,1 @@
+csrf_token|s:64:"fe5904255c494dbd77e5d81cd0d5b1837998d14b37a5158e860e3e1913f108d2";flash|a:1:{s:5:"error";s:47:"Неверные логин или пароль";}user|a:4:{s:2:"id";i:2;s:5:"login";s:7:"seller1";s:5:"email";s:15:"seller1@mail.ru";s:4:"role";s:6:"SELLER";}

@@ -1,0 +1,4 @@
+# Minimal .htaccess
+Options -Indexes
+RewriteEngine On
+# (оставьте ваши правила, если они были нужны)

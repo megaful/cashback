@@ -1,0 +1,1 @@
+csrf_token|s:64:"77f1da9f08adb224461ba4361d3fb72a353d125848914218e1c885e8bdc744be";flash|a:1:{s:5:"error";s:47:"Неверные логин или пароль";}user|a:4:{s:2:"id";i:1;s:5:"login";s:5:"ADMIN";s:5:"email";s:19:"zerguud88@gmail.com";s:4:"role";s:5:"ADMIN";}
