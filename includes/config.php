@@ -16,6 +16,15 @@ define('DB_CHARSET', 'utf8mb4');
 // Комиссия сервиса
 define('SERVICE_COMMISSION_RUB', 100);
 
+// ЮKassa
+define('YOO_SHOP_ID',    '1095973');
+define('YOO_SECRET_KEY', 'live_iJtcZsBlWfzlYQFoKW9NeHCLWmK_XeIjfQvffrM1B0k'); // храним как секрет!
+
+// Для чека (54-ФЗ)
+define('YOO_TAX_SYSTEM',  2); // 1=ОСН, 2=УСН доход, 3=УСН доход-расход, 4=ЕНВД, 5=Патент, 6=ЕСХН
+define('YOO_VAT_CODE',    6); // 1=20%, 2=10%, 3=расч. ставка 20/120, 4=расч. 10/110, 5=0%, 6=без НДС
+
+
 // Ограничения загрузки
 define('MAX_UPLOAD_BYTES', 10 * 1024 * 1024); // 10 MB
 $ALLOWED_MIME = ['image/png','image/jpeg'];

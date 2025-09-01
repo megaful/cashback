@@ -30,7 +30,7 @@ try{
   $rows=$st->fetchAll();
 }catch(Throwable $e){ $err=$e->getMessage(); }
 
-$csrf=function_exists('csrf_token')?csrf_token():'';
+$csrf=function_exists('csrf_token')?csrf_token():''; 
 $actionUrl='/admin/listings_status.php';
 ?>
 <!doctype html><html lang="ru"><head>
@@ -91,6 +91,10 @@ $actionUrl='/admin/listings_status.php';
           <td class="px-3 py-2"><?php if($reason!=='') echo h($reason); ?></td>
           <td class="px-3 py-2">
             <div class="flex flex-col gap-2">
+              <!-- Кнопка редактирования -->
+              <a href="/admin/listing_edit.php?id=<?php echo (int)$r['id']; ?>" 
+                 class="px-2 py-1 rounded border bg-blue-600 text-white text-center">Редактировать</a>
+
               <?php if($r['status']===S_PENDING): ?>
                 <form class="flex flex-wrap items-center gap-2" method="post" action="<?php echo h($actionUrl); ?>">
                   <input type="hidden" name="csrf_token" value="<?php echo h($csrf); ?>">

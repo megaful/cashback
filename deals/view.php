@@ -1,17 +1,12 @@
 <?php
-// deals/view.php — устойчивый к 500 вариант (fixed):
-// • Этапы сделки (принятие, оплата-заглушка, отправка на проверку, решение продавца, арбитраж)
-// • Чат + загрузка вложений (png/jpg, до 5 файлов, до 10 МБ каждый)
-// • Автодетект имён колонок в deal_messages и deal_attachments
-// • Понятные сообщения вместо HTTP 500
-// • Исправлено: обрыв разметки, отсутствующая форма чата, сортировка по времени/ID, мелкие UX/безопасность
+// deals/view.php — страница сделки с оплатой через ЮKassa (инициация в /pay/yookassa_create.php)
 
 error_reporting(E_ALL);
 ini_set('display_errors', '1');
 
 function h($s){ return htmlspecialchars((string)$s, ENT_QUOTES|ENT_SUBSTITUTE, 'UTF-8'); }
 
-// Ловим любые необработанные исключения и показываем их красиво (чтобы не было 500)
+// Мягкий обработчик исключений, чтобы вместо 500 показать понятную ошибку
 set_exception_handler(function($e){
   http_response_code(200);
   echo '<!doctype html><meta charset="utf-8"><style>
@@ -38,7 +33,7 @@ $user = function_exists('current_user') ? current_user() : ($_SESSION['user'] ??
 if (!$user || empty($user['id'])) throw new Exception('Пользователь не определён.');
 $uid = (int)$user['id'];
 
-/* ---------- хелперы по схеме БД ---------- */
+/* ---------- утилиты для схемы БД ---------- */
 function has_col(PDO $pdo, string $table, string $col): bool {
   $q=$pdo->prepare("SELECT COUNT(*) c FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=? AND COLUMN_NAME=?");
   $q->execute([$table,$col]); return (int)($q->fetch()['c'] ?? 0) > 0;
@@ -66,18 +61,32 @@ if (!$deal) throw new Exception('Сделка не найдена.');
 $admin    = function_exists('is_admin') ? is_admin() : (strtoupper($user['role'] ?? '')==='ADMIN');
 if ($deal['seller_id'] != $uid && $deal['buyer_id'] != $uid && !$admin) throw new Exception('Доступ запрещён.');
 
-$status    = (string)$deal['status'];
-$isSeller  = ((int)$deal['seller_id'] === $uid);
-$isBuyer   = ((int)$deal['buyer_id']  === $uid);
-$isListing = !empty($deal['listing_id']);
+$status     = (string)$deal['status'];
+$isSeller   = ((int)$deal['seller_id'] === $uid);
+$isBuyer    = ((int)$deal['buyer_id']  === $uid);
+$isListing  = !empty($deal['listing_id']);
+$initiator  = (int)($deal['created_by'] ?? 0);
 
 /* ---------- права на действия ---------- */
-$canAcceptPending     = ($status==='PENDING_ACCEPTANCE') ? ($isListing ? $isSeller : $isBuyer) : false;
-$canRejectAtPending   = ($status==='PENDING_ACCEPTANCE') && ($isSeller || $isBuyer);
-$canPayFund           = ($status==='AWAITING_FUNDING')   && $isSeller;
-$canSubmitWork        = ($status==='FUNDED')             && $isBuyer;
-$canSellerDecision    = ($isSeller && $status==='SUBMITTED'); // продавец решает: принять/отклонить/арбитраж
-$canOpenDispute       = ($isSeller && in_array($status, ['FUNDED','IN_PROGRESS','SUBMITTED'], true));
+$shouldSellerAccept = ($initiator === (int)$deal['buyer_id']);  // инициатор — покупатель ⇒ принимает продавец
+$shouldBuyerAccept  = ($initiator === (int)$deal['seller_id']); // инициатор — продавец  ⇒ принимает покупатель
+
+$canAcceptPending = ($status === 'PENDING_ACCEPTANCE') && (
+  ($shouldSellerAccept && $isSeller) || ($shouldBuyerAccept && $isBuyer)
+);
+$canRejectAtPending = ($status==='PENDING_ACCEPTANCE') && ($isSeller || $isBuyer);
+
+// Покупатель может отправлять работу как из FUNDED (первично), так и из IN_PROGRESS (повторно)
+$canSubmitWork     = ($isBuyer && in_array($status, ['FUNDED','IN_PROGRESS'], true));
+
+// Оплату в гарант вносит продавец, когда статус AWAITING_FUNDING
+$canPayFund        = ($status==='AWAITING_FUNDING') && $isSeller;
+
+// После отправки на проверку продавец принимает решение
+$canSellerDecision = ($isSeller && $status==='SUBMITTED');
+
+// Арбитраж
+$canOpenDispute    = (($isSeller || $isBuyer) && in_array($status, ['IN_PROGRESS','SUBMITTED','FUNDED'], true));
 
 /* ---------- чат закрывается в финале ---------- */
 $chatLockedForUsers = in_array($status, ['ACCEPTED','RESOLVED_ACCEPTED','REJECTED','RESOLVED_REJECTED'], true);
@@ -85,28 +94,26 @@ $chatMayPost        = !($chatLockedForUsers && !$admin);
 
 /* ---------- deal_messages / attachments авто-детект ---------- */
 $dm_text  = pick_col($pdo,'deal_messages',['message','content','text','body']);
-$dm_time  = pick_col($pdo,'deal_messages',['created_at','created','createdAt','created_at_utc']); // расширил набор на всякий
-$dm_id    = has_col($pdo,'deal_messages','id') ? 'id' : null; // на случай кастомных PK
+$dm_time  = pick_col($pdo,'deal_messages',['created_at','created','createdAt','created_at_utc']);
+$dm_id    = has_col($pdo,'deal_messages','id') ? 'id' : null;
 
 $hasAtt   = has_table($pdo,'deal_attachments');
 $da_path  = $hasAtt ? pick_col($pdo,'deal_attachments',['file_path','path','filepath','file']) : null;
 $da_mime  = $hasAtt ? pick_col($pdo,'deal_attachments',['mime_type','mime','type','content_type']) : null;
 $da_size  = $hasAtt ? pick_col($pdo,'deal_attachments',['file_size','size','bytes']) : null;
 
-/* ---------- кошелёк: безопасное начисление ---------- */
+/* ---------- безопасные операции с кошельком (используются при подтверждении) ---------- */
 function credit_user_safe(PDO $pdo, int $userId, int $amount, string $desc=''): void {
-  // balances
   $pdo->prepare("INSERT INTO balances (user_id, balance) VALUES (?,0) ON DUPLICATE KEY UPDATE balance=balance")->execute([$userId]);
   $pdo->prepare("UPDATE balances SET balance=balance+? WHERE user_id=?")->execute([$amount,$userId]);
-  // wallet_entries (если есть)
   if (has_table($pdo,'wallet_entries')) {
     $hasType = has_col($pdo,'wallet_entries','type');
     $hasDesc = has_col($pdo,'wallet_entries','description');
     $hasTime = has_col($pdo,'wallet_entries','created_at');
-    $fields=['user_id','amount']; $place=['?','?']; $vals=[$userId,$amount];
+    $fields=['user_id','amount']; $place=['?','?']; $vals=[ $userId, $amount ];
     if ($hasType){ $fields[]='type'; $place[]='?'; $vals[]='DEAL_CREDIT'; }
     if ($hasDesc){ $fields[]='description'; $place[]='?'; $vals[]=$desc; }
-    if ($hasTime){ $fields[]='created_at'; $place[]='NOW()'; }
+    if ($hasTime){ $fields[]='created_at'; $place.=',NOW()'; }
     $sql="INSERT INTO wallet_entries (".implode(',',$fields).") VALUES (".implode(',',$place).")";
     $pdo->prepare($sql)->execute($vals);
   }
@@ -128,7 +135,7 @@ function insert_dispute_safe(PDO $pdo, int $dealId, int $openedBy, string $reaso
 if ($_SERVER['REQUEST_METHOD']==='POST') {
   if (function_exists('check_csrf')) { try { check_csrf(); } catch(Throwable $e){ throw new Exception('CSRF: '.$e->getMessage()); } }
 
-  // Принять условия
+  // Принятие условий
   if (isset($_POST['action']) && $_POST['action']==='accept' && $canAcceptPending) {
     $pdo->beginTransaction();
     $pdo->prepare("UPDATE deals SET status='AWAITING_FUNDING' WHERE id=?")->execute([$id]);
@@ -145,7 +152,7 @@ if ($_SERVER['REQUEST_METHOD']==='POST') {
     $pdo->commit(); header('Location: /deals/view.php?id='.$id); exit;
   }
 
-  // Отклонить на этапе ожидания принятия
+  // Отклонение на принятии
   if (isset($_POST['action']) && $_POST['action']==='reject_pending' && $canRejectAtPending) {
     $reason = trim($_POST['reason'] ?? '');
     $pdo->beginTransaction();
@@ -161,35 +168,31 @@ if ($_SERVER['REQUEST_METHOD']==='POST') {
     $pdo->commit(); header('Location: /deals/view.php?id='.$id); exit;
   }
 
-  // Оплата в гарант (заглушка) => FUNDED
-  if (isset($_POST['action']) && $_POST['action']==='pay_fund' && $canPayFund) {
-    $pdo->beginTransaction();
-    $pdo->prepare("UPDATE deals SET status='FUNDED' WHERE id=?")->execute([$id]);
-    if (function_exists('safe_system_message')) {
-      $total=(int)$deal['cashback'] + (int)$deal['commission'];
-      safe_system_message($pdo,$id,"Продавец внёс в гарант ₽ {$total}. Сделка переведена в статус «Оплачено».",$uid);
-    }
-    if (function_exists('notify')) notify($pdo,(int)$deal['buyer_id'],"Сделка {$deal['number']} оплачена","/deals/view.php?id=".$id);
-    $pdo->commit(); header('Location: /deals/view.php?id='.$id); exit;
-  }
-
-  // Покупатель: отправить на проверку => SUBMITTED
+  // Покупатель отправляет работу (первично или повторно)
   if (isset($_POST['action']) && $_POST['action']==='submit_work' && $canSubmitWork) {
     $pdo->beginTransaction();
     $pdo->prepare("UPDATE deals SET status='SUBMITTED' WHERE id=?")->execute([$id]);
     if (function_exists('safe_system_message')) {
-      safe_system_message($pdo,$id,"Покупатель отправил работу на проверку. Продавец может принять, отклонить или открыть арбитраж.",$uid);
+      $txt = ($status==='IN_PROGRESS')
+        ? "Покупатель повторно отправил работу на проверку. Продавец может принять, отклонить или открыть арбитраж."
+        : "Покупатель отправил работу на проверку. Продавец может принять, отклонить или открыть арбитраж.";
+      safe_system_message($pdo,$id,$txt,$uid);
     }
     if (function_exists('notify')) notify($pdo,(int)$deal['seller_id'],"Работа по {$deal['number']} отправлена на проверку","/deals/view.php?id=".$id);
     $pdo->commit(); header('Location: /deals/view.php?id='.$id); exit;
   }
 
-  // ПРОДАВЕЦ: Подтвердить выполнение => ACCEPTED + зачислить кэшбэк покупателю
+  // Продавец подтверждает выполнение
   if (isset($_POST['action']) && $_POST['action']==='seller_accept' && $canSellerDecision) {
     $pdo->beginTransaction();
     $pdo->prepare("UPDATE deals SET status='ACCEPTED' WHERE id=?")->execute([$id]);
     $cash = (int)$deal['cashback'];
-    credit_user_safe($pdo, (int)$deal['buyer_id'], $cash, "Выплата по сделке {$deal['number']}");
+    $pdo->prepare("INSERT INTO balances (user_id, balance) VALUES (?,0) ON DUPLICATE KEY UPDATE balance=balance")->execute([(int)$deal['buyer_id']]);
+    $pdo->prepare("UPDATE balances SET balance=balance+? WHERE user_id=?")->execute([$cash,(int)$deal['buyer_id']]);
+    if (has_table($pdo,'wallet_entries')) {
+      $pdo->prepare("INSERT INTO wallet_entries (user_id, amount, direction, memo, deal_id) VALUES (?,?,?,?,?)")
+          ->execute([(int)$deal['buyer_id'],$cash,'CREDIT','Выплата по сделке '.$deal['number'],(int)$deal['id']]);
+    }
     if (function_exists('safe_system_message')) {
       safe_system_message($pdo,$id,"Продавец подтвердил выполнение. Покупателю зачислено ₽ {$cash}.",$uid);
     }
@@ -199,7 +202,7 @@ if ($_SERVER['REQUEST_METHOD']==='POST') {
     $pdo->commit(); header('Location: /deals/view.php?id='.$id); exit;
   }
 
-  // ПРОДАВЕЦ: Отклонить работу => деньги остаются в сделке, статус IN_PROGRESS
+  // Продавец отклоняет работу — назад в IN_PROGRESS
   if (isset($_POST['action']) && $_POST['action']==='seller_reject' && $canSellerDecision) {
     $reason = trim($_POST['reason'] ?? '');
     $pdo->beginTransaction();
@@ -214,24 +217,30 @@ if ($_SERVER['REQUEST_METHOD']==='POST') {
     $pdo->commit(); header('Location: /deals/view.php?id='.$id); exit;
   }
 
-  // ПРОДАВЕЦ: Арбитраж => DISPUTE_OPENED
+  // Открыть арбитраж
   if (isset($_POST['action']) && $_POST['action']==='open_dispute' && $canOpenDispute) {
     $reason = trim($_POST['reason'] ?? '');
     $pdo->beginTransaction();
     $pdo->prepare("UPDATE deals SET status='DISPUTE_OPENED' WHERE id=?")->execute([$id]);
-    insert_dispute_safe($pdo,$id,$uid,$reason);
+    try{
+      if (has_table($pdo,'disputes')){
+        $pdo->prepare("INSERT INTO disputes (deal_id, opened_by, reason, created_at) VALUES (?,?,?,NOW())")
+            ->execute([$id,$uid,$reason]);
+      }
+    }catch(Throwable $e){}
     if (function_exists('safe_system_message')) {
       $txt='Открыт арбитраж'.($reason?': '.$reason:'');
       safe_system_message($pdo,$id,$txt,$uid);
     }
     if (function_exists('notify')) {
-      notify($pdo,(int)$deal['buyer_id'],"Открыт арбитраж по {$deal['number']}","/deals/view.php?id=".$id);
+      $other = ($uid==(int)$deal['seller_id']) ? (int)$deal['buyer_id'] : (int)$deal['seller_id'];
+      notify($pdo,$other,"Открыт арбитраж по {$deal['number']}","/deals/view.php?id=".$id);
       if (function_exists('notify_admin')) { @notify_admin($pdo,"Арбитраж по {$deal['number']}", "/admin/deals.php?id=".$id); }
     }
     $pdo->commit(); header('Location: /deals/view.php?id='.$id); exit;
   }
 
-  // Сообщение в чат (с вложениями)
+  // Сообщение в чат
   if (isset($_POST['action']) && $_POST['action']==='message' && $chatMayPost) {
     $text = trim($_POST['text'] ?? '');
     if ($text==='' && empty($_FILES['files']['name'][0])) throw new Exception('Введите сообщение или добавьте файл.');
@@ -254,14 +263,11 @@ if ($_SERVER['REQUEST_METHOD']==='POST') {
         if (!in_array($ext,['jpg','jpeg','png'],true)) continue; if ($size>10*1024*1024) continue;
         $tmp=$_FILES['files']['tmp_name'][$i]; $safe=bin2hex(random_bytes(16)).'.'.$ext; $dest=$uploadDir.'/'.$safe;
         if (move_uploaded_file($tmp,$dest)) {
-          // динамически строим INSERT для deal_attachments
           $fields=['message_id']; $place=['?']; $vals=[$msgId];
-          if ($da_path){ $fields[]=$da_path; $place[]='?'; $vals[]='/uploads/'.$safe; }
+          $pathCol = $da_path ?: (has_col($pdo,'deal_attachments','file_path') ? 'file_path' : null);
+          if ($pathCol){ $fields[]=$pathCol; $place[]='?'; $vals[]='/uploads/'.$safe; }
           if ($da_mime){ $fields[]=$da_mime; $place[]='?'; $vals[]=($ext==='png'?'image/png':'image/jpeg'); }
           if ($da_size){ $fields[]=$da_size; $place[]='?'; $vals[]=$size; }
-          if (!$da_path && !$da_mime && !$da_size && has_col($pdo,'deal_attachments','file_path')){
-            $fields[]='file_path'; $place[]='?'; $vals[]='/uploads/'.$safe;
-          }
           $sqlAtt="INSERT INTO deal_attachments (".implode(',',$fields).") VALUES (".implode(',',$place).")";
           $pdo->prepare($sqlAtt)->execute($vals);
         }
@@ -279,10 +285,8 @@ if ($_SERVER['REQUEST_METHOD']==='POST') {
 /* ---------- чтение сообщений ---------- */
 $msgs=[];
 if ($dm_text) {
-  // аккуратно формируем выражение для сортировки
   $selText="m.`{$dm_text}`";
   $selTime = $dm_time ? "m.`{$dm_time}`" : ($dm_id ? "m.`{$dm_id}`" : "m.`{$dm_text}`");
-  // если нет явного времени и PK, fallback к ID (обычно есть), иначе сортируем по вставочному полю
   $orderExpr = $dm_time ? "`{$dm_time}` ASC, m.id ASC" : "m.id ASC";
 
   $sqlMsgs="SELECT m.*,u.login,{$selText} AS msg_text,{$selTime} AS msg_created
@@ -293,7 +297,7 @@ if ($dm_text) {
   $st=$pdo->prepare($sqlMsgs); $st->execute([$id]); $msgs=$st->fetchAll();
 }
 
-/* ---------- русификация ---------- */
+/* ---------- русификация статусов ---------- */
 if (!function_exists('status_ru')) {
   function status_ru($s){ return [
     'PENDING_ACCEPTANCE'=>'Ожидает подтверждения',
@@ -312,51 +316,69 @@ if (!function_exists('status_ru')) {
 <!doctype html>
 <html lang="ru"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title><?php echo h($deal['number']); ?></title>
+<title><?= h($deal['number']) ?> — Сделка</title>
 <script src="https://cdn.tailwindcss.com"></script>
+<style>
+  :root{ --g1:#8A00FF; --g2:#005BFF; }
+  body{
+    background:linear-gradient(180deg,#f5ecff,#eef4ff 220px),
+               linear-gradient(180deg,var(--g1),var(--g2)) fixed;
+  }
+  .card{border:1px solid #e6e8f0;border-radius:20px}
+  .glass{background:rgba(255,255,255,.86);backdrop-filter:saturate(140%) blur(6px);}
+  .btn-grad{background:linear-gradient(90deg,#8A00FF,#005BFF); color:#fff}
+  .btn-grad:hover{filter:brightness(.95)}
+  .chip{display:inline-flex;align-items:center;gap:8px;border:1px solid #e5e7eb;border-radius:9999px;padding:6px 12px;background:#fff}
+</style>
 </head>
-<body class="bg-slate-50">
+<body class="text-slate-900">
 <?php @include __DIR__.'/../includes/topbar.php'; ?>
-<main class="max-w-5xl mx-auto px-4 py-6">
-  <a href="/dashboard/index.php" class="text-sm">&larr; Назад</a>
+
+<main class="max-w-5xl mx-auto px-4 py-5 md:py-8">
+  <a href="/dashboard/index.php" class="text-sm">← Назад</a>
 
   <div class="mt-3 grid md:grid-cols-3 gap-4">
-    <section class="md:col-span-2 rounded-2xl border bg-white p-5">
+    <!-- Основной блок сделки -->
+    <section class="md:col-span-2 card glass p-5 md:p-6">
       <div class="flex items-center justify-between gap-3">
-        <h1 class="text-xl font-semibold"><?php echo h($deal['number']); ?></h1>
-        <div class="text-sm text-slate-500"><?php echo h(status_ru($status)); ?></div>
-      </div>
-      <div class="mt-2 text-sm text-slate-600">
-        Продавец: <b><?php echo h($deal['seller_login']); ?></b> ·
-        Покупатель: <b><?php echo h($deal['buyer_login']); ?></b>
+        <h1 class="text-lg md:text-xl font-semibold"><?= h($deal['number']) ?></h1>
+        <div class="text-sm text-slate-600"><?= h(status_ru($status)); ?></div>
       </div>
 
-      <div class="mt-2">
-        <div class="font-medium"><?php echo h($deal['title']); ?></div>
+      <div class="mt-2 text-sm text-slate-700">
+        Продавец: <b><?= h($deal['seller_login']) ?></b> ·
+        Покупатель: <b><?= h($deal['buyer_login']) ?></b>
+      </div>
+
+      <div class="mt-3">
+        <div class="font-medium"><?= h($deal['title']); ?></div>
         <?php if(!empty($deal['product_url'])): ?>
-          <div class="break-all text-sm">Товар: <a class="underline" target="_blank" href="<?php echo h($deal['product_url']); ?>"><?php echo h($deal['product_url']); ?></a></div>
+          <div class="break-all text-sm mt-1">
+            Товар: <a class="underline" target="_blank" href="<?= h($deal['product_url']); ?>"><?= h($deal['product_url']); ?></a>
+          </div>
         <?php endif; ?>
-        <div class="text-sm mt-1">Кэшбэк: <b>₽ <?php echo (int)$deal['cashback']; ?></b> + комиссия сервиса <b>₽ <?php echo (int)$deal['commission']; ?></b></div>
+        <div class="text-sm mt-1">Кэшбэк: <b>₽ <?= (int)$deal['cashback']; ?></b> + комиссия сервиса <b>₽ <?= (int)$deal['commission']; ?></b></div>
         <?php if(!empty($deal['terms_text'])): ?>
-          <div class="mt-3 text-sm whitespace-pre-line"><?php echo h($deal['terms_text']); ?></div>
+          <div class="mt-3 text-sm whitespace-pre-line"><?= h($deal['terms_text']); ?></div>
         <?php endif; ?>
         <?php if($isListing): ?>
           <div class="mt-2 text-xs text-slate-500">Сделка создана по объявлению (Витрина).</div>
         <?php endif; ?>
       </div>
 
+      <!-- Кнопки состояний -->
       <?php if ($status==='PENDING_ACCEPTANCE'): ?>
         <div class="mt-4 flex flex-wrap gap-2">
           <?php if ($canAcceptPending): ?>
             <form method="post">
-              <?php if(function_exists('csrf_token')): ?><input type="hidden" name="csrf_token" value="<?php echo h(csrf_token()); ?>"><?php endif; ?>
+              <?php if(function_exists('csrf_token')): ?><input type="hidden" name="csrf_token" value="<?= h(csrf_token()); ?>"><?php endif; ?>
               <input type="hidden" name="action" value="accept">
-              <button class="px-4 py-2 rounded-xl bg-black text-white">Принять условия</button>
+              <button class="px-4 py-2 rounded-full btn-grad">Принять условия</button>
             </form>
           <?php endif; ?>
           <?php if ($canRejectAtPending): ?>
             <form method="post" class="flex flex-wrap gap-2 items-center">
-              <?php if(function_exists('csrf_token')): ?><input type="hidden" name="csrf_token" value="<?php echo h(csrf_token()); ?>"><?php endif; ?>
+              <?php if(function_exists('csrf_token')): ?><input type="hidden" name="csrf_token" value="<?= h(csrf_token()); ?>"><?php endif; ?>
               <input type="hidden" name="action" value="reject_pending">
               <input class="px-3 py-2 rounded-xl border" name="reason" placeholder="Причина (необязательно)">
               <button class="px-4 py-2 rounded-xl border">Отклонить</button>
@@ -366,49 +388,58 @@ if (!function_exists('status_ru')) {
       <?php endif; ?>
 
       <?php if ($canPayFund): ?>
-        <div class="mt-4 p-4 rounded-xl border bg-slate-50">
-          <div class="text-sm">К оплате в гарант: <b>₽ <?php echo (int)$deal['cashback'] + (int)$deal['commission']; ?></b>
-            (кэшбэк ₽<?php echo (int)$deal['cashback']; ?> + комиссия ₽<?php echo (int)$deal['commission']; ?>)
+        <div class="mt-4 p-4 rounded-2xl border bg-white/70">
+          <div class="text-sm">
+            К оплате в гарант: <b>₽ <?= (int)$deal['cashback'] + (int)$deal['commission']; ?></b>
+            (кэшбэк ₽<?= (int)$deal['cashback']; ?> + комиссия ₽<?= (int)$deal['commission']; ?>)
           </div>
-          <form method="post" class="mt-2">
-            <?php if(function_exists('csrf_token')): ?><input type="hidden" name="csrf_token" value="<?php echo h(csrf_token()); ?>"><?php endif; ?>
-            <input type="hidden" name="action" value="pay_fund">
-            <button class="px-4 py-2 rounded-xl bg-emerald-600 text-white">Оплатить в гарант (ЮKassa)</button>
+          <form method="post" action="/pay/yookassa_create.php" class="mt-2">
+            <?php if(function_exists('csrf_token')): ?><input type="hidden" name="csrf_token" value="<?= h(csrf_token()); ?>"><?php endif; ?>
+            <input type="hidden" name="deal_id" value="<?= (int)$deal['id']; ?>">
+            <button class="px-4 py-2 rounded-full btn-grad">Оплатить в гарант (ЮKassa)</button>
           </form>
-          <div class="text-xs text-slate-500 mt-2">Сейчас это заглушка: оплата сразу переводит сделку в статус «Оплачено».</div>
+          <div class="text-xs text-slate-500 mt-2">После успешной оплаты вы вернётесь на эту страницу. Статус станет «Оплачено».</div>
         </div>
       <?php endif; ?>
 
       <?php if ($canSubmitWork): ?>
-        <div class="mt-4 p-4 rounded-xl border bg-slate-50">
-          <div class="text-sm">После выполнения задания отправьте работу на проверку продавцу.</div>
+        <div class="mt-4 p-4 rounded-2xl border bg-white/70">
+          <div class="text-sm">
+            <?php if($status==='IN_PROGRESS'): ?>
+              Продавец запросил доработку. Прикрепите недостающие пруфы в чат ниже и отправьте повторно на проверку.
+            <?php else: ?>
+              После выполнения задания отправьте работу на проверку продавцу.
+            <?php endif; ?>
+          </div>
           <form method="post" class="mt-2">
-            <?php if(function_exists('csrf_token')): ?><input type="hidden" name="csrf_token" value="<?php echo h(csrf_token()); ?>"><?php endif; ?>
+            <?php if(function_exists('csrf_token')): ?><input type="hidden" name="csrf_token" value="<?= h(csrf_token()); ?>"><?php endif; ?>
             <input type="hidden" name="action" value="submit_work">
-            <button class="px-4 py-2 rounded-xl bg-black text-white">Отправить на проверку (подтвердить выполнение)</button>
+            <button class="px-4 py-2 rounded-full btn-grad">
+              <?= ($status==='IN_PROGRESS') ? 'Повторно отправить на проверку' : 'Отправить на проверку (подтвердить выполнение)'; ?>
+            </button>
           </form>
           <div class="text-xs text-slate-500 mt-2">Скриншоты и комментарии прикладывайте в чат ниже.</div>
         </div>
       <?php endif; ?>
 
       <?php if ($canSellerDecision): ?>
-        <div class="mt-4 p-4 rounded-xl border bg-slate-50">
+        <div class="mt-4 p-4 rounded-2xl border bg-white/70">
           <div class="text-sm font-medium mb-2">Решение продавца:</div>
           <div class="flex flex-col gap-2">
             <form method="post">
-              <?php if(function_exists('csrf_token')): ?><input type="hidden" name="csrf_token" value="<?php echo h(csrf_token()); ?>"><?php endif; ?>
+              <?php if(function_exists('csrf_token')): ?><input type="hidden" name="csrf_token" value="<?= h(csrf_token()); ?>"><?php endif; ?>
               <input type="hidden" name="action" value="seller_accept">
-              <button class="px-4 py-2 rounded-xl bg-emerald-600 text-white">Подтвердить выполнение</button>
+              <button class="px-4 py-2 rounded-full btn-grad">Подтвердить выполнение</button>
             </form>
             <form method="post" class="flex flex-wrap gap-2 items-center">
-              <?php if(function_exists('csrf_token')): ?><input type="hidden" name="csrf_token" value="<?php echo h(csrf_token()); ?>"><?php endif; ?>
+              <?php if(function_exists('csrf_token')): ?><input type="hidden" name="csrf_token" value="<?= h(csrf_token()); ?>"><?php endif; ?>
               <input type="hidden" name="action" value="seller_reject">
               <input class="px-3 py-2 rounded-xl border" name="reason" placeholder="Причина отклонения (желательно)">
               <button class="px-4 py-2 rounded-xl bg-amber-600 text-white">Отклонить</button>
               <span class="text-xs text-slate-600">Средства остаются в гарант-счёте, покупатель может доработать и отправить заново.</span>
             </form>
             <form method="post" class="flex flex-wrap gap-2 items-center">
-              <?php if(function_exists('csrf_token')): ?><input type="hidden" name="csrf_token" value="<?php echo h(csrf_token()); ?>"><?php endif; ?>
+              <?php if(function_exists('csrf_token')): ?><input type="hidden" name="csrf_token" value="<?= h(csrf_token()); ?>"><?php endif; ?>
               <input type="hidden" name="action" value="open_dispute">
               <input class="px-3 py-2 rounded-xl border" name="reason" placeholder="Краткая причина (необязательно)">
               <button class="px-4 py-2 rounded-xl bg-red-600 text-white">Арбитраж</button>
@@ -416,23 +447,24 @@ if (!function_exists('status_ru')) {
           </div>
         </div>
       <?php endif; ?>
-
     </section>
 
-    <aside class="rounded-2xl border bg-white p-5">
+    <!-- Боковая панель -->
+    <aside class="card glass p-5 md:p-6">
       <h3 class="font-semibold">Действия</h3>
-      <div class="mt-2 text-sm text-slate-600">
+      <div class="mt-2 text-sm text-slate-700">
         Процесс: Принятие условий → Оплата продавцом → Выполнение покупателем → (Принять / Отклонить / Арбитраж) → Решение.
       </div>
-      <div class="mt-3 text-xs text-slate-500">Текущий статус: <?php echo h(status_ru($status)); ?></div>
+      <div class="mt-3 text-xs text-slate-600">Текущий статус: <?= h(status_ru($status)); ?></div>
     </aside>
   </div>
 
-  <section id="chat" class="mt-4 rounded-2xl border bg-white p-5">
+  <!-- ЧАТ -->
+  <section id="chat" class="mt-4 card glass p-5 md:p-6">
     <h2 class="text-lg font-semibold mb-2">Чат сделки</h2>
 
     <?php if (!$dm_text): ?>
-      <div class="rounded-xl border bg-yellow-50 text-yellow-800 p-3">
+      <div class="rounded-xl border bg-yellow-50 text-yellow-900 p-3">
         В таблице <b>deal_messages</b> не найдена текстовая колонка (ожидались: <code>message</code>, <code>content</code>, <code>text</code>, <code>body</code>).
         Пример:
         <pre style="white-space:pre-wrap">ALTER TABLE deal_messages ADD COLUMN message TEXT NOT NULL;</pre>
@@ -447,10 +479,10 @@ if (!function_exists('status_ru')) {
     ?>
     <div class="space-y-3">
       <?php foreach ($msgs as $m): ?>
-        <div class="rounded-xl border p-3 <?php echo ($m['sender_id']==$uid)?'bg-slate-50':''; ?>">
-          <div class="text-sm text-slate-500"><?php echo h($m['login'] ?: ('User #'.$m['sender_id'])); ?> · <?php echo h($m['msg_created']); ?></div>
+        <div class="rounded-xl border p-3 <?= ($m['sender_id']==$uid)?'bg-slate-50':''; ?>">
+          <div class="text-sm text-slate-500"><?= h($m['login'] ?: ('User #'.$m['sender_id'])); ?> · <?= h($m['msg_created']); ?></div>
           <?php if(!empty($m['msg_text'])): ?>
-            <div class="mt-1 whitespace-pre-line"><?php echo nl2br(h($m['msg_text'])); ?></div>
+            <div class="mt-1 whitespace-pre-line"><?= nl2br(h($m['msg_text'])); ?></div>
           <?php endif; ?>
 
           <?php if ($attStmt && $pathOut): ?>
@@ -458,8 +490,8 @@ if (!function_exists('status_ru')) {
             <?php if ($atts): ?>
               <div class="mt-2 flex gap-2 flex-wrap">
                 <?php foreach($atts as $a): $p=$a[$pathOut]??null; if(!$p) continue; ?>
-                  <a class="inline-block" href="<?php echo h($p); ?>" target="_blank" rel="noopener">
-                    <img src="<?php echo h($p); ?>" alt="" style="max-height:120px;border-radius:12px;border:1px solid #e5e7eb;">
+                  <a class="inline-block" href="<?= h($p); ?>" target="_blank" rel="noopener">
+                    <img src="<?= h($p); ?>" alt="" style="max-height:120px;border-radius:12px;border:1px solid #e5e7eb;">
                   </a>
                 <?php endforeach; ?>
               </div>
@@ -467,27 +499,28 @@ if (!function_exists('status_ru')) {
           <?php endif; ?>
         </div>
       <?php endforeach; if (!$msgs): ?>
-        <div class="text-slate-500">Сообщений пока нет.</div>
+        <div class="text-slate-600">Сообщений пока нет.</div>
       <?php endif; ?>
     </div>
 
     <?php if ($chatMayPost && $dm_text): ?>
-      <form class="mt-4 space-y-2" method="post" enctype="multipart/form-data" action="/deals/view.php?id=<?php echo (int)$id; ?>#chat">
-        <?php if(function_exists('csrf_token')): ?><input type="hidden" name="csrf_token" value="<?php echo h(csrf_token()); ?>"><?php endif; ?>
+      <form class="mt-4 space-y-2" method="post" enctype="multipart/form-data" action="/deals/view.php?id=<?= (int)$id; ?>#chat">
+        <?php if(function_exists('csrf_token')): ?><input type="hidden" name="csrf_token" value="<?= h(csrf_token()); ?>"><?php endif; ?>
         <input type="hidden" name="action" value="message">
         <textarea name="text" rows="3" class="w-full rounded-xl border p-3" placeholder="Напишите сообщение…"></textarea>
-        <div class="flex items-center justify-between gap-3">
-          <div class="text-sm text-slate-600">
-            <input type="file" name="files[]" multiple accept=".jpg,.jpeg,.png" class="block">
+
+        <!-- Мобильная правка: в колонку, кнопка на всю ширину; на широкой — в линию -->
+        <div class="flex flex-col sm:flex-row sm:items-center gap-3">
+          <div class="text-sm text-slate-700 w-full sm:w-auto">
+            <input type="file" name="files[]" multiple accept=".jpg,.jpeg,.png" class="block w-full">
             <div class="text-xs text-slate-500">До 5 файлов · JPG/PNG · до 10 МБ каждый</div>
           </div>
-          <button class="px-4 py-2 rounded-xl bg-black text-white">Отправить</button>
+          <button class="w-full sm:w-auto px-4 py-2 rounded-full btn-grad">Отправить</button>
         </div>
       </form>
     <?php elseif(!$chatMayPost): ?>
-      <div class="mt-3 text-sm text-slate-500">Чат закрыт, т.к. сделка завершена. Администраторы могут писать всегда.</div>
+      <div class="mt-3 text-sm text-slate-600">Чат закрыт, т.к. сделка завершена. Администраторы могут писать всегда.</div>
     <?php endif; ?>
-
   </section>
 </main>
 </body>
